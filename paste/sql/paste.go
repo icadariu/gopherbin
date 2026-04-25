@@ -236,6 +236,8 @@ func (p *paste) sqlToCommonPaste(modelPaste models.Paste, withPreview bool) para
 		Public:      modelPaste.Public,
 		CreatedAt:   modelPaste.CreatedAt,
 		Expires:     modelPaste.Expires,
+		MaxAccesses: modelPaste.MaxAccesses,
+		AccessCount: modelPaste.AccessCount,
 		CreatedBy:   modelPaste.Owner.FullName,
 		Metadata:    metadata,
 	}
@@ -252,7 +254,8 @@ func (p *paste) Create(
 	title, language, description string,
 	expires *time.Time,
 	isPublic bool, team string,
-	metadata map[string]string) (paste params.Paste, err error) {
+	metadata map[string]string,
+	maxAccesses *int) (paste params.Paste, err error) {
 
 	pasteID, err := util.GetRandomString(24)
 	if err != nil {
@@ -288,6 +291,7 @@ func (p *paste) Create(
 		Name:        title,
 		Description: description,
 		Metadata:    encodedMetadata,
+		MaxAccesses: maxAccesses,
 	}
 	q := p.conn.Create(&newPaste)
 	if q.Error != nil {
@@ -341,6 +345,17 @@ func (p *paste) GetPublicPaste(ctx context.Context, pasteID string) (params.Past
 		}
 		return params.Paste{}, errors.Wrap(q.Error, "fetching paste from database")
 	}
+	if tmpPaste.MaxAccesses != nil {
+		if err := p.conn.Model(&tmpPaste).UpdateColumn(
+			"access_count", gorm.Expr("access_count + 1"),
+		).Error; err != nil {
+			return params.Paste{}, errors.Wrap(err, "incrementing access count")
+		}
+		tmpPaste.AccessCount++
+		if tmpPaste.AccessCount >= *tmpPaste.MaxAccesses {
+			p.conn.Unscoped().Delete(&tmpPaste)
+		}
+	}
 	return p.sqlToCommonPaste(tmpPaste, false), nil
 }
 
@@ -357,6 +372,17 @@ func (p *paste) getPaste(pasteID string, user models.Users) (models.Paste, error
 	}
 	if canAccess := p.canAccess(tmpPaste, user); !canAccess {
 		return models.Paste{}, gErrors.ErrNotFound
+	}
+	if tmpPaste.MaxAccesses != nil {
+		if err := p.conn.Model(&tmpPaste).UpdateColumn(
+			"access_count", gorm.Expr("access_count + 1"),
+		).Error; err != nil {
+			return models.Paste{}, errors.Wrap(err, "incrementing access count")
+		}
+		tmpPaste.AccessCount++
+		if tmpPaste.AccessCount >= *tmpPaste.MaxAccesses {
+			p.conn.Unscoped().Delete(&tmpPaste)
+		}
 	}
 	return tmpPaste, nil
 }
