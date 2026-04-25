@@ -30,6 +30,7 @@ import (
 	"gopherbin/util"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/pkg/errors"
 )
@@ -353,45 +354,49 @@ func (p *paste) canAccess(paste models.Paste, user models.Users) bool {
 
 func (p *paste) GetPublicPaste(ctx context.Context, pasteID string) (params.Paste, error) {
 	var tmpPaste models.Paste
-	now := time.Now()
-	q := p.conn.Where(
-		"paste_id = ? and (expires is NULL or expires >= ?) and public = ?", pasteID, now, true).First(&tmpPaste)
-	if q.Error != nil {
-		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
-			return params.Paste{}, gErrors.ErrNotFound
+	err := p.conn.Transaction(func(tx *gorm.DB) error {
+		now := time.Now()
+		q := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+			"paste_id = ? and (expires is NULL or expires >= ?) and public = ?", pasteID, now, true).First(&tmpPaste)
+		if q.Error != nil {
+			if errors.Is(q.Error, gorm.ErrRecordNotFound) {
+				return gErrors.ErrNotFound
+			}
+			return errors.Wrap(q.Error, "fetching paste from database")
 		}
-		return params.Paste{}, errors.Wrap(q.Error, "fetching paste from database")
-	}
-	if tmpPaste.MaxAccesses != nil {
-		if err := p.conn.Transaction(func(tx *gorm.DB) error {
+		if tmpPaste.MaxAccesses != nil {
 			return p.incrementAndMaybeDestroy(tx, &tmpPaste)
-		}); err != nil {
-			return params.Paste{}, err
 		}
+		return nil
+	})
+	if err != nil {
+		return params.Paste{}, err
 	}
 	return p.sqlToCommonPaste(tmpPaste, false), nil
 }
 
 func (p *paste) getPaste(pasteID string, user models.Users) (models.Paste, error) {
 	var tmpPaste models.Paste
-	now := time.Now()
-	q := p.conn.Preload("Users").Preload("Owner").Where(
-		"paste_id = ? and (expires is NULL or expires >= ?)", pasteID, now).First(&tmpPaste)
-	if q.Error != nil {
-		if errors.Is(q.Error, gorm.ErrRecordNotFound) {
-			return models.Paste{}, gErrors.ErrNotFound
+	err := p.conn.Transaction(func(tx *gorm.DB) error {
+		now := time.Now()
+		q := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Preload("Users").Preload("Owner").Where(
+			"paste_id = ? and (expires is NULL or expires >= ?)", pasteID, now).First(&tmpPaste)
+		if q.Error != nil {
+			if errors.Is(q.Error, gorm.ErrRecordNotFound) {
+				return gErrors.ErrNotFound
+			}
+			return errors.Wrap(q.Error, "fetching paste from database")
 		}
-		return models.Paste{}, errors.Wrap(q.Error, "fetching paste from database")
-	}
-	if canAccess := p.canAccess(tmpPaste, user); !canAccess {
-		return models.Paste{}, gErrors.ErrNotFound
-	}
-	if tmpPaste.MaxAccesses != nil {
-		if err := p.conn.Transaction(func(tx *gorm.DB) error {
+		if canAccess := p.canAccess(tmpPaste, user); !canAccess {
+			return gErrors.ErrNotFound
+		}
+		if tmpPaste.MaxAccesses != nil {
 			return p.incrementAndMaybeDestroy(tx, &tmpPaste)
-		}); err != nil {
-			return models.Paste{}, err
 		}
+		return nil
+	})
+	if err != nil {
+		return models.Paste{}, err
 	}
 	return tmpPaste, nil
 }
