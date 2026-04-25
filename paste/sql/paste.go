@@ -218,6 +218,23 @@ func (p *paste) getUserByUsernameOrEmail(userID string) (models.Users, error) {
 	return tmpUser, nil
 }
 
+// incrementAndMaybeDestroy increments the access counter and, if the paste has
+// reached its access limit, hard-deletes it. Must be called inside a transaction.
+func (p *paste) incrementAndMaybeDestroy(tx *gorm.DB, pst *models.Paste) error {
+	if err := tx.Model(pst).UpdateColumn(
+		"access_count", gorm.Expr("access_count + 1"),
+	).Error; err != nil {
+		return errors.Wrap(err, "incrementing access count")
+	}
+	pst.AccessCount++
+	if pst.AccessCount >= *pst.MaxAccesses {
+		if err := tx.Unscoped().Delete(pst).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.Wrap(err, "deleting exhausted paste")
+		}
+	}
+	return nil
+}
+
 func (p *paste) sqlToCommonPaste(modelPaste models.Paste, withPreview bool) params.Paste {
 	metadata := make(map[string]string)
 	if modelPaste.Metadata != nil {
@@ -346,14 +363,10 @@ func (p *paste) GetPublicPaste(ctx context.Context, pasteID string) (params.Past
 		return params.Paste{}, errors.Wrap(q.Error, "fetching paste from database")
 	}
 	if tmpPaste.MaxAccesses != nil {
-		if err := p.conn.Model(&tmpPaste).UpdateColumn(
-			"access_count", gorm.Expr("access_count + 1"),
-		).Error; err != nil {
-			return params.Paste{}, errors.Wrap(err, "incrementing access count")
-		}
-		tmpPaste.AccessCount++
-		if tmpPaste.AccessCount >= *tmpPaste.MaxAccesses {
-			p.conn.Unscoped().Delete(&tmpPaste)
+		if err := p.conn.Transaction(func(tx *gorm.DB) error {
+			return p.incrementAndMaybeDestroy(tx, &tmpPaste)
+		}); err != nil {
+			return params.Paste{}, err
 		}
 	}
 	return p.sqlToCommonPaste(tmpPaste, false), nil
@@ -374,14 +387,10 @@ func (p *paste) getPaste(pasteID string, user models.Users) (models.Paste, error
 		return models.Paste{}, gErrors.ErrNotFound
 	}
 	if tmpPaste.MaxAccesses != nil {
-		if err := p.conn.Model(&tmpPaste).UpdateColumn(
-			"access_count", gorm.Expr("access_count + 1"),
-		).Error; err != nil {
-			return models.Paste{}, errors.Wrap(err, "incrementing access count")
-		}
-		tmpPaste.AccessCount++
-		if tmpPaste.AccessCount >= *tmpPaste.MaxAccesses {
-			p.conn.Unscoped().Delete(&tmpPaste)
+		if err := p.conn.Transaction(func(tx *gorm.DB) error {
+			return p.incrementAndMaybeDestroy(tx, &tmpPaste)
+		}); err != nil {
+			return models.Paste{}, err
 		}
 	}
 	return tmpPaste, nil
